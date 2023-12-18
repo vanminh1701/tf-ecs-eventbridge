@@ -13,18 +13,25 @@ locals {
   vpc_cidr = var.vpc_cidr
   azs      = slice(data.aws_availability_zones.available.names, 0, 3)
 
+  capacities = {
+    ondemand = "ex_1"
+    fargate  = "ex_ecs"
+  }
+
   service_objects = {
     kuard = {
       container_name   = "kuard"
       container_port   = 8080
       alb_target_group = "ex_ecs"
       image            = "gcr.io/kuar-demo/kuard-amd64:blue"
+      desired_count    = 1
     }
     nginx = {
       container_name   = "nginx"
       container_port   = 80
       alb_target_group = "ex_1"
       image            = "nginxdemos/hello"
+      desired_count    = 2
     }
   }
 
@@ -33,6 +40,8 @@ locals {
       # Enables ECS Exec
       enable_execute_command = true
 
+      desired_count = each_service.desired_count
+
       # Container definition(s)
       container_definitions = {
         (each_service.container_name) = {
@@ -40,6 +49,7 @@ locals {
           memory    = 1024
           essential = true
           image     = each_service.image
+
           port_mappings = [{
             name          = each_service.container_name
             containerPort = each_service.container_port
@@ -91,9 +101,6 @@ locals {
 
   }
 
-  container_name = "kuard"
-  container_port = 8080
-
   slack_input_transformer = {
     input_paths = {
       id = "$.id"
@@ -131,8 +138,8 @@ module "ecs_cluster" {
 
   autoscaling_capacity_providers = {
     # On-demand instances
-    ex_1 = {
-      auto_scaling_group_arn         = module.autoscaling["ex_1"].autoscaling_group_arn
+    (local.capacities.ondemand) = {
+      auto_scaling_group_arn         = module.autoscaling[local.capacities.ondemand].autoscaling_group_arn
       managed_termination_protection = "ENABLED"
 
       managed_scaling = {
@@ -162,7 +169,7 @@ module "autoscaling" {
 
   for_each = {
     # On-demand instances
-    ex_1 = {
+    (local.capacities.ondemand) = {
       instance_type              = "t3.medium"
       use_mixed_instances_policy = false
       mixed_instances_policy     = {}
@@ -225,24 +232,15 @@ module "autoscaling_sg" {
   description = "Autoscaling group security group"
   vpc_id      = module.vpc.vpc_id
 
-  computed_ingress_with_source_security_group_id = [
-    {
-      rule                     = "http-80-tcp"
-      source_security_group_id = module.alb.security_group_id
-    }
-  ]
+  computed_ingress_with_source_security_group_id = [{
+    rule                     = "http-80-tcp"
+    source_security_group_id = module.alb.security_group_id
+  }]
   number_of_computed_ingress_with_source_security_group_id = 1
 
   egress_rules = ["all-all"]
 
   tags = local.tags
-}
-
-
-resource "aws_service_discovery_http_namespace" "this" {
-  name        = local.name
-  description = "CloudMap namespace for ${local.name}"
-  tags        = local.tags
 }
 
 module "alb" {
@@ -288,9 +286,7 @@ module "alb" {
         nginx = {
           priority = 1
           conditions = [{
-            path_pattern = {
-              values = ["/nginx"]
-            }
+            path_pattern = { values = ["/nginx"] }
           }]
           actions = [{
             type             = "forward"
@@ -303,33 +299,9 @@ module "alb" {
   }
 
   target_groups = {
-    ex_ecs = {
+    for each_service in local.service_objects : each_service.alb_target_group => {
       backend_protocol                  = "HTTP"
-      backend_port                      = local.container_port
-      target_type                       = "ip"
-      deregistration_delay              = 5
-      load_balancing_cross_zone_enabled = true
-
-      health_check = {
-        enabled             = true
-        healthy_threshold   = 5
-        interval            = 30
-        matcher             = "200"
-        path                = "/"
-        port                = "traffic-port"
-        protocol            = "HTTP"
-        timeout             = 5
-        unhealthy_threshold = 2
-      }
-
-      # There's nothing to attach here in this definition. Instead,
-      # ECS will attach the IPs of the tasks to this target group
-      create_attachment = false
-    }
-
-    ex_1 = {
-      backend_protocol                  = "HTTP"
-      backend_port                      = 80
+      backend_port                      = each_service.container_port
       target_type                       = "ip"
       deregistration_delay              = 5
       load_balancing_cross_zone_enabled = true
@@ -376,7 +348,8 @@ module "vpc" {
 # EventBridge
 # ################################################################################
 module "eventbridge" {
-  source = "terraform-aws-modules/eventbridge/aws"
+  source  = "terraform-aws-modules/eventbridge/aws"
+  version = "~> 3.0"
 
   create_bus              = false
   create_connections      = true
